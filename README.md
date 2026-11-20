@@ -1,5 +1,4 @@
-Raw Markdown Output (README.md)
-Copy and paste the raw text below directly into your README.md file:
+
 
 # AFL-2 — Information Security & Cryptography
 
