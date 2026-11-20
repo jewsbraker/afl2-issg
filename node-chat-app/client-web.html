@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Secure Chat App — Cryptography Demo</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    body { margin: 0; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; height: 100vh; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; width: 100%; max-width: 720px; height: 90vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
+    #login-screen { padding: 40px; text-align: center; margin: auto; }
+    #login-screen input { padding: 12px 16px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: white; font-size: 16px; width: 260px; margin-right: 8px; }
+    button { padding: 12px 18px; border-radius: 8px; border: none; background: #3b82f6; color: white; font-weight: 600; cursor: pointer; transition: 0.2s; }
+    button:hover { background: #2563eb; }
+    #chat-screen { display: none; flex-direction: column; height: 100%; }
+    .header { padding: 16px 20px; background: #0f172a; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+    .badge { background: #1e293b; border: 1px solid #38bdf8; color: #38bdf8; padding: 4px 10px; border-radius: 999px; font-size: 13px; }
+    .controls { padding: 12px 20px; background: #162032; border-bottom: 1px solid #334155; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; font-size: 13px; }
+    .control-group { display: flex; align-items: center; gap: 6px; }
+    select { padding: 6px 10px; border-radius: 6px; background: #0f172a; color: #f8fafc; border: 1px solid #475569; }
+    #messages { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 80%; padding: 10px 14px; border-radius: 10px; background: #334155; line-height: 1.4; word-break: break-word; }
+    .msg.me { align-self: flex-end; background: #1d4ed8; }
+    .msg.secret { border: 1px solid #10b981; background: #064e3b; }
+    .msg.cipher { border: 1px dashed #64748b; background: #1e293b; color: #94a3b8; font-family: monospace; font-size: 12px; }
+    .msg-meta { font-size: 12px; font-weight: bold; margin-bottom: 4px; color: #93c5fd; }
+    .msg.me .msg-meta { color: #dbeafe; }
+    .warning { margin-top: 6px; padding: 6px 10px; border-radius: 6px; background: #7f1d1d; color: #fecaca; font-size: 12px; font-weight: 600; border: 1px solid #ef4444; }
+    .sys-msg { align-self: center; font-size: 12px; color: #94a3b8; background: #0f172a; padding: 4px 12px; border-radius: 999px; }
+    .input-area { padding: 14px 20px; background: #0f172a; border-top: 1px solid #334155; display: flex; gap: 10px; }
+    .input-area input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #1e293b; color: white; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="login-screen">
+      <h2>🔐 Secure Chat (Web UI)</h2>
+      <p style="color:#94a3b8; margin-bottom:20px;">SHA-256 Integrity • RSA Signature • RSA Secret Chat</p>
+      <input type="text" id="username-input" placeholder="Enter your username (e.g. Alice)" />
+      <button onclick="joinChat()">Join Chat</button>
+    </div>
+
+    <div id="chat-screen">
+      <div class="header">
+        <div>
+          <strong id="display-user">User</strong>
+          <span class="badge" id="status-badge">Normal Mode</span>
+        </div>
+        <span style="font-size:12px; color:#94a3b8;">Users Online: <strong id="user-count">0</strong></span>
+      </div>
+
+      <div class="controls">
+        <div class="control-group">
+          <label for="impersonate-select">🎭 Impersonate:</label>
+          <select id="impersonate-select" onchange="updateStatusBadge()">
+            <option value="">None (Normal Identity)</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label for="secret-select">🔒 Secret Target:</label>
+          <select id="secret-select" onchange="updateStatusBadge()">
+            <option value="">Public (Everyone)</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="messages"></div>
+
+      <form class="input-area" onsubmit="sendMessage(event)">
+        <input type="text" id="msg-input" placeholder="Type a message..." autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    let registeredUsername = "";
+    let mySignKeyPair = null;
+    let myEncKeyPair = null;
+    const users = new Map();
+
+    function bufToHex(buffer) {
+      return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+    function hexToBuf(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+      return bytes.buffer;
+    }
+
+    async function sha256Hex(text) {
+      const data = new TextEncoder().encode(text);
+      const hashBuf = await crypto.subtle.digest("SHA-256", data);
+      return bufToHex(hashBuf);
+    }
+
+    async function initCryptoKeys() {
+      mySignKeyPair = await crypto.subtle.generateKey(
+        { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+        true,
+        ["sign", "verify"]
+      );
+      myEncKeyPair = await crypto.subtle.generateKey(
+        { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+        true,
+        ["encrypt", "decrypt"]
+      );
+      const signPubJwk = await crypto.subtle.exportKey("jwk", mySignKeyPair.publicKey);
+      const encPubJwk = await crypto.subtle.exportKey("jwk", myEncKeyPair.publicKey);
+      return JSON.stringify({ signPubJwk, encPubJwk });
+    }
+
+    async function joinChat() {
+      const input = document.getElementById("username-input").value.trim();
+      if (!input) return alert("Please enter a username!");
+      registeredUsername = input;
+
+      const pubKeyBundle = await initCryptoKeys();
+      socket.emit("registerPublicKey", { username: registeredUsername, publicKey: pubKeyBundle });
+
+      document.getElementById("login-screen").style.display = "none";
+      document.getElementById("chat-screen").style.display = "flex";
+      document.getElementById("display-user").textContent = registeredUsername;
+    }
+
+    function refreshUserDropdowns() {
+      const impSelect = document.getElementById("impersonate-select");
+      const secSelect = document.getElementById("secret-select");
+      const currentImp = impSelect.value;
+      const currentSec = secSelect.value;
+
+      impSelect.innerHTML = `<option value="">None (${registeredUsername})</option>`;
+      secSelect.innerHTML = `<option value="">Public (Everyone)</option>`;
+
+      users.forEach((_, user) => {
+        if (user !== registeredUsername) {
+          impSelect.innerHTML += `<option value="${user}">${user}</option>`;
+          secSelect.innerHTML += `<option value="${user}">${user}</option>`;
+        }
+      });
+
+      impSelect.value = users.has(currentImp) ? currentImp : "";
+      secSelect.value = users.has(currentSec) ? currentSec : "";
+      document.getElementById("user-count").textContent = users.size;
+    }
+
+    function updateStatusBadge() {
+      const imp = document.getElementById("impersonate-select").value;
+      const sec = document.getElementById("secret-select").value;
+      const badge = document.getElementById("status-badge");
+
+      if (imp && sec) badge.textContent = `Impersonating ${imp} + Secret to ${sec}`;
+      else if (imp) badge.textContent = `Impersonating as ${imp}`;
+      else if (sec) badge.textContent = `Secret Chat with ${sec}`;
+      else badge.textContent = "Normal Mode";
+    }
+
+    function addSystemMessage(text) {
+      const div = document.createElement("div");
+      div.className = "sys-msg";
+      div.textContent = text;
+      document.getElementById("messages").appendChild(div);
+    }
+
+    async function sendMessage(e) {
+      e.preventDefault();
+      const input = document.getElementById("msg-input");
+      const plainText = input.value.trim();
+      if (!plainText) return;
+
+      const impTarget = document.getElementById("impersonate-select").value;
+      const secTarget = document.getElementById("secret-select").value;
+      const activeUsername = impTarget || registeredUsername;
+
+      let contentToSend = plainText;
+      let isEncrypted = false;
+
+      if (secTarget && users.has(secTarget)) {
+        const targetKeys = JSON.parse(users.get(secTarget));
+        const targetEncKey = await crypto.subtle.importKey(
+          "jwk",
+          targetKeys.encPubJwk,
+          { name: "RSA-OAEP", hash: "SHA-256" },
+          false,
+          ["encrypt"]
+        );
+        const cipherBuf = await crypto.subtle.encrypt(
+          { name: "RSA-OAEP" },
+          targetEncKey,
+          new TextEncoder().encode(plainText)
+        );
+        contentToSend = bufToHex(cipherBuf);
+        isEncrypted = true;
+      }
+
+      const hash = await sha256Hex(contentToSend);
+
+      const sigBuf = await crypto.subtle.sign(
+        { name: "RSASSA-PKCS1-v1_5" },
+        mySignKeyPair.privateKey,
+        new TextEncoder().encode(contentToSend)
+      );
+      const sig = bufToHex(sigBuf);
+
+      const packet = JSON.stringify({
+        senderId: socket.id,
+        content: contentToSend,
+        hash,
+        sig,
+        isEncrypted,
+        target: secTarget || null
+      });
+
+      socket.emit("message", { username: activeUsername, message: packet });
+
+      renderMessage({
+        sender: impTarget ? `${registeredUsername} (as ${impTarget})` : registeredUsername,
+        text: secTarget ? `[Secret to ${secTarget}] ${plainText}` : plainText,
+        isMe: true,
+        isSecret: Boolean(secTarget),
+        isCipher: false,
+        warnings: []
+      });
+
+      input.value = "";
+    }
+
+    socket.on("init", (entries) => {
+      entries.forEach(([user, key]) => users.set(user, key));
+      refreshUserDropdowns();
+    });
+
+    socket.on("newUser", (data) => {
+      users.set(data.username, data.publicKey);
+      refreshUserDropdowns();
+      if (registeredUsername) addSystemMessage(`${data.username} joined the chat`);
+    });
+
+    socket.on("message", async (data) => {
+      const { username: senderUsername, message: rawMessage } = data;
+      let warnings = [];
+      let parsed = null;
+
+      try {
+        parsed = JSON.parse(rawMessage);
+      } catch (err) {
+        warnings.push("⚠️ WARNING: Message was tampered/modified by the server during transmission!");
+        const lastBrace = rawMessage.lastIndexOf("}");
+        if (lastBrace !== -1) {
+          try { parsed = JSON.parse(rawMessage.slice(0, lastBrace + 1)); } catch (_) {}
+        }
+      }
+
+      if (!parsed) {
+        renderMessage({ sender: senderUsername, text: rawMessage, isMe: false, warnings });
+        return;
+      }
+
+      if (parsed.senderId === socket.id) return;
+
+      const expectedHash = await sha256Hex(parsed.content);
+      if (parsed.hash !== expectedHash && warnings.length === 0) {
+        warnings.push("⚠️ WARNING: Hash mismatch! Message may have been altered.");
+      }
+
+      let isAuthentic = false;
+      if (users.has(senderUsername)) {
+        try {
+          const senderKeys = JSON.parse(users.get(senderUsername));
+          const senderVerifyKey = await crypto.subtle.importKey(
+            "jwk",
+            senderKeys.signPubJwk,
+            { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+            false,
+            ["verify"]
+          );
+          isAuthentic = await crypto.subtle.verify(
+            { name: "RSASSA-PKCS1-v1_5" },
+            senderVerifyKey,
+            hexToBuf(parsed.sig),
+            new TextEncoder().encode(parsed.content)
+          );
+        } catch (_) { isAuthentic = false; }
+      }
+
+      if (!isAuthentic) {
+        warnings.push("⚠️ WARNING: This user is fake! (RSA Signature verification failed)");
+      }
+
+      let displayText = parsed.content;
+      let isSecret = false;
+      let isCipher = false;
+
+      if (parsed.isEncrypted) {
+        try {
+          const plainBuf = await crypto.subtle.decrypt(
+            { name: "RSA-OAEP" },
+            myEncKeyPair.privateKey,
+            hexToBuf(parsed.content)
+          );
+          displayText = new TextDecoder().decode(plainBuf);
+          isSecret = true;
+        } catch (_) {
+          displayText = parsed.content;
+          isCipher = true;
+        }
+      }
+
+      renderMessage({
+        sender: isSecret ? `${senderUsername} (Secret Message)` : senderUsername,
+        text: displayText,
+        isMe: false,
+        isSecret,
+        isCipher,
+        warnings
+      });
+    });
+
+    function renderMessage({ sender, text, isMe, isSecret, isCipher, warnings }) {
+      const box = document.getElementById("messages");
+      const div = document.createElement("div");
+      div.className = `msg ${isMe ? "me" : ""} ${isSecret ? "secret" : ""} ${isCipher ? "cipher" : ""}`;
+
+      const meta = document.createElement("div");
+      meta.className = "msg-meta";
+      meta.textContent = sender;
+      div.appendChild(meta);
+
+      const body = document.createElement("div");
+      body.textContent = text;
+      div.appendChild(body);
+
+      warnings.forEach(w => {
+        const warnDiv = document.createElement("div");
+        warnDiv.className = "warning";
+        warnDiv.textContent = w;
+        div.appendChild(warnDiv);
+      });
+
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+  </script>
+</body>
+</html>
